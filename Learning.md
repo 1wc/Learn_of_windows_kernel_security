@@ -12,5 +12,47 @@
 
 ## Day2
 
+- 复习Modern Windows Exploit和Exploit编写教程（用户态的windows exploit）
+  - 基础栈溢出
+  - 基于SEH的栈溢出
+  - Unicode Exploit
+  - Windows ROP
+- Windows Kernel Exploit环境配置（<https://bbs.pediy.com/thread-252309.htm>）
+  - 安装Windows 7 x86 sp1虚拟机
+  - 安装VirtualKD
+  - 成功启动内核调试
 
+## Day3
 
+- 阅读《Windows内核原理与实现》1~33页
+
+  - 第一章：概述
+
+    - 操作系统概述
+      - 计算机系统的硬件资源管理
+      - 为应用程序提供执行环境
+    - Windows发展历史
+    - 操作系统研究进展
+
+  - 第二章：Windows系统总述
+
+    - 现代操作系统的基本结构
+    - Windows系统结构
+      - Windows系统结构图
+        - HAL、内核、执行体、ntdll.dll、设备驱动程序、WIndows子系统内核模块
+      - Windows内核结构
+      - Windows内核中的关键组件
+        - HAL hal.dll
+        - 内核（微内核）ntoskrnl.exe的下层
+        - 执行体 ntoskrnl.exe的上层：线程和进程管理、内存管理器、安全引用监视器、I/O管理器、缓存管理器、配置管理器、即插即用管理器、电源管理器；支持函数：对象管理器、LPC设施、运行时库函数、执行体支持例程
+        - 设备驱动程序
+        - 文件系统/存储管理：NTFS、FAT
+        - 网络：Winsock、WinInet等等
+      - Windows子系统
+        - 包含
+          - 用户态：csrss.exe、一组DLL（kernel32.dll, user32.dll, gdi32.dll, advapi.dll）
+            - 前者负责控制台窗口的功能和进程、线程创建；后者实现文档化的Win32 API，有些可以在用户态完成，大多需要调用执行体API活win32k.sys提供的服务
+          - 内核态：win32k.sys
+            - 窗口管理和图形设备管理
+
+    
