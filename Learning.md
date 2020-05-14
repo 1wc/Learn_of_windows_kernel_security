@@ -55,4 +55,48 @@
           - 内核态：win32k.sys
             - 窗口管理和图形设备管理
 
-    
+## Day4
+
+- 编译HEVD
+  - 安装VS 2015 + Windows SDK + Windows Driver Kit 10
+  - 解决编译错误
+    - 创建测试签名
+    - lnf2Cat使用local时间
+- 环境配置问题
+
+  - VMware 14与宿主机Win 10 1903的兼容性不好（由于Win10的沙盒机制），更新到Vmware 15.5
+  - Vmware 15.5与VirtualKD不兼容，改用VirtualKD-Redux
+
+- 阅读MSRC的《Solving Uninitialized Stack Memory on Windows》（https://msrc-blog.microsoft.com/2020/05/13/solving-uninitialized-stack-memory-on-windows/）
+  - 未初始化内存漏洞的潜在解决方案
+    - 静态分析（编译时和编译后）
+      - VS提供静态分析warning，但比较保守，为了减少误报
+      - codeql规则，误报太多
+    - Fuzzing
+      - 未初始化漏洞不会crash，不容易监控
+    - 代码审计
+    - **自动初始化 InitAll——自动化的编译时栈变量初始化**
+      - kernel态代码、Hyper-V代码和一些其他代码开启
+      - 在编译器前端实现
+      - 初始化为0：比较好的一种方式
+      - 在Win 10 1903开始引入
+  - 因InitAll引入的UAF漏洞
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
