@@ -82,7 +82,13 @@
       - 在Win 10 1903开始引入
   - 因InitAll引入的UAF漏洞
 
+## Day5 & Day6
 
+调试学习了HEVD的`UseAfterFreeNonPagedPool`
+
+## Day7
+
+调试学习了HEVD的`BufferOverflowStack`
 
 
 

