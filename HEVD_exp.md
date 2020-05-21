@@ -47,8 +47,6 @@ Address  PID  Image file name
 
 用whoami命令查看权限，发现已经变为系统权限。
 
-![image-20200514192810869](C:\Users\liwc1\AppData\Roaming\Typora\typora-user-images\image-20200514192810869.png)
-
 ## 线程 & 进程的数据结构与提权shellcode
 
 用windbg的dg指令查看段描述符：
